@@ -1,0 +1,321 @@
+# Uses Tabulate Area instead of ZonalStatisticsAsTable or Combine.
+# Rasterises parcel IDs once, then counts class area per parcel for each RAW raster.
+# Picks the class with the largest area as the parcel majority.
+# Uses Lookup to create one parcel-majority raster per RAW raster.
+
+import arcpy
+import os
+import traceback
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs):
+        return x
+
+from arcpy.sa import TabulateArea, Lookup
+
+# -------------------------------------------------------------------------
+# SETTINGS
+# -------------------------------------------------------------------------
+
+rasters_gdb = r"C:\T6DinB\Downscaler\DESNZ_delivered_2025\2025_Raw.gdb"
+parcels_fc = r"C:\T6DinB\Downscaler\backupAndTestsAndStuff.gdb\parcels_1_1"
+out_gdb = r"C:\T6DinB\Downscaler\Combined_Datasets.gdb"
+
+raster_pattern = "P1_2030_RAW"
+
+zone_field = "ZS_UID"
+zone_raster_name = "parcel_zone_ids"
+majority_field = "MAJ_CLASS"
+
+# Keep low if memory is tight
+arcpy.env.parallelProcessingFactor = "0"
+
+# -------------------------------------------------------------------------
+# SETUP
+# -------------------------------------------------------------------------
+
+arcpy.env.overwriteOutput = True
+arcpy.env.addOutputsToMap = False
+
+arcpy.CheckOutExtension("Spatial")
+
+if not arcpy.Exists(out_gdb):
+    arcpy.management.CreateFileGDB(
+        os.path.dirname(out_gdb),
+        os.path.basename(out_gdb)
+    )
+
+if not arcpy.Exists(rasters_gdb):
+    raise RuntimeError(f"Raster GDB does not exist: {rasters_gdb}")
+
+if not arcpy.Exists(parcels_fc):
+    raise RuntimeError(f"Parcels feature class does not exist: {parcels_fc}")
+
+# -------------------------------------------------------------------------
+# LIST RASTERS
+# -------------------------------------------------------------------------
+
+arcpy.env.workspace = rasters_gdb
+rasters = arcpy.ListRasters(raster_pattern)
+
+if not rasters:
+    raise RuntimeError(f"No rasters found matching: {raster_pattern}")
+
+raster_items = []
+
+for r in rasters:
+    r_path = arcpy.Describe(r).catalogPath
+    if arcpy.Exists(r_path):
+        raster_items.append((r, r_path))
+
+if not raster_items:
+    raise RuntimeError("No valid rasters found.")
+
+first_raster = raster_items[0][1]
+
+arcpy.env.snapRaster = first_raster
+arcpy.env.cellSize = first_raster
+arcpy.env.extent = first_raster
+
+# -------------------------------------------------------------------------
+# CREATE PARCEL ZONE RASTER ONCE
+# -------------------------------------------------------------------------
+
+zone_raster = os.path.join(out_gdb, zone_raster_name)
+
+if not arcpy.Exists(zone_raster):
+
+    parcels_working = os.path.join(out_gdb, "parcels_working_for_zones")
+
+    if arcpy.Exists(parcels_working):
+        arcpy.management.Delete(parcels_working)
+
+    print("Creating safe parcel copy...")
+    arcpy.management.CopyFeatures(parcels_fc, parcels_working)
+
+    desc = arcpy.Describe(parcels_working)
+    oid_field = desc.OIDFieldName
+
+    fields = [f.name for f in arcpy.ListFields(parcels_working)]
+
+    if zone_field not in fields:
+        arcpy.management.AddField(parcels_working, zone_field, "LONG")
+
+    print(f"Populating {zone_field} from {oid_field}...")
+
+    with arcpy.da.UpdateCursor(parcels_working, [oid_field, zone_field]) as cur:
+        for oid, _ in tqdm(cur, desc="Parcel IDs", unit="parcel"):
+            cur.updateRow([oid, oid])
+
+    print("Rasterising parcel IDs once...")
+
+    arcpy.conversion.PolygonToRaster(
+        in_features=parcels_working,
+        value_field=zone_field,
+        out_rasterdataset=zone_raster,
+        cell_assignment="MAXIMUM_AREA",
+        priority_field="NONE",
+        cellsize=first_raster
+    )
+
+else:
+    print("Using existing parcel zone raster:")
+    print(zone_raster)
+
+print("Building parcel-zone raster attribute table...")
+arcpy.management.BuildRasterAttributeTable(zone_raster, "Overwrite")
+
+zone_fields = [f.name for f in arcpy.ListFields(zone_raster)]
+
+if majority_field not in zone_fields:
+    arcpy.management.AddField(zone_raster, majority_field, "LONG")
+
+# -------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------------------------------
+
+def clear_majority_field(raster, field_name):
+    with arcpy.da.UpdateCursor(raster, ["VALUE", field_name]) as cur:
+        for value, old in cur:
+            cur.updateRow([value, None])
+
+
+def get_value_fields(tabulate_table):
+    """
+    In CLASSES_AS_FIELDS mode, TabulateArea creates fields such as VALUE_1,
+    VALUE_2, VALUE_3, etc. Each field stores area for that class.
+    """
+    fields = []
+
+    ignore = {
+        "OBJECTID", "OID", "FID",
+        "VALUE", "COUNT",
+        "ZONE_CODE", "ZS_UID"
+    }
+
+    for f in arcpy.ListFields(tabulate_table):
+        name_upper = f.name.upper()
+
+        if name_upper in ignore:
+            continue
+
+        # TabulateArea class fields are usually numeric fields
+        if f.type in ("SmallInteger", "Integer", "Single", "Double"):
+            fields.append(f.name)
+
+    return fields
+
+
+def class_value_from_field(field_name):
+    """
+    Converts TabulateArea field names like VALUE_3 to class value 3.
+    If the field is just 3 or Class_3, it tries to extract the final number.
+    """
+    parts = field_name.split("_")
+
+    for part in reversed(parts):
+        try:
+            return int(part)
+        except Exception:
+            pass
+
+    raise RuntimeError(f"Could not extract class value from field: {field_name}")
+
+
+# -------------------------------------------------------------------------
+# PROCESS EACH RAW RASTER
+# -------------------------------------------------------------------------
+
+successful = []
+failed = []
+
+for ras_name, in_raster in tqdm(raster_items, desc="Processing rasters", unit="raster"):
+
+    print("\n" + "=" * 70)
+    print(f"Processing: {ras_name}")
+
+    try:
+        arcpy.env.snapRaster = in_raster
+        arcpy.env.cellSize = in_raster
+        arcpy.env.extent = in_raster
+
+        base = arcpy.ValidateTableName(ras_name, out_gdb)
+
+        if base.lower().endswith("_raw"):
+            base = base[:-4]
+
+        tab_table = os.path.join(
+            out_gdb,
+            arcpy.ValidateTableName(f"{base}_TABAREA", out_gdb)
+        )
+
+        out_raster = os.path.join(
+            out_gdb,
+            arcpy.ValidateTableName(f"{base}_MAJ", out_gdb)
+        )
+
+        if arcpy.Exists(tab_table):
+            arcpy.management.Delete(tab_table)
+
+        if arcpy.Exists(out_raster):
+            arcpy.management.Delete(out_raster)
+
+        print("  Running Tabulate Area...")
+
+        TabulateArea(
+            in_zone_data=zone_raster,
+            zone_field="VALUE",
+            in_class_data=in_raster,
+            class_field="VALUE",
+            out_table=tab_table,
+            processing_cell_size=in_raster,
+            classes_as_rows="CLASSES_AS_FIELDS"
+        )
+
+        print("  Reading Tabulate Area table...")
+
+        value_fields = get_value_fields(tab_table)
+
+        if not value_fields:
+            raise RuntimeError("No class area fields found in Tabulate Area table.")
+
+        print(f"  Class fields found: {value_fields}")
+
+        # Build dictionary:
+        # parcel zone value -> majority class
+        majority_by_zone = {}
+
+        cursor_fields = ["VALUE"] + value_fields
+
+        with arcpy.da.SearchCursor(tab_table, cursor_fields) as cur:
+            for row in cur:
+                zone_value = row[0]
+                class_areas = row[1:]
+
+                best_class = None
+                best_area = None
+
+                for field_name, area in zip(value_fields, class_areas):
+                    if area is None:
+                        continue
+
+                    if best_area is None or area > best_area:
+                        best_area = area
+                        best_class = class_value_from_field(field_name)
+
+                if best_class is not None and best_area is not None and best_area > 0:
+                    majority_by_zone[zone_value] = best_class
+
+        print(f"  Zones with majority class: {len(majority_by_zone)}")
+
+        print("  Writing majority class to parcel-zone raster table...")
+
+        clear_majority_field(zone_raster, majority_field)
+
+        with arcpy.da.UpdateCursor(zone_raster, ["VALUE", majority_field]) as cur:
+            for zone_value, old_maj in cur:
+                maj = majority_by_zone.get(zone_value)
+                cur.updateRow([zone_value, maj])
+
+        print("  Creating final majority raster using Lookup...")
+
+        maj_raster = Lookup(zone_raster, majority_field)
+        maj_raster.save(out_raster)
+
+        print(f"  Saved: {out_raster}")
+
+        successful.append(ras_name)
+
+        # Optional: delete table to save space after output is created.
+        # Comment this out if you want to inspect the class areas.
+        # arcpy.management.Delete(tab_table)
+
+    except Exception as e:
+        print(f"  FAILED: {ras_name}")
+        print(f"  Reason: {e}")
+        print(traceback.format_exc())
+
+        failed.append((ras_name, str(e)))
+        continue
+
+# -------------------------------------------------------------------------
+# SUMMARY
+# -------------------------------------------------------------------------
+
+print("\n" + "=" * 70)
+print("DONE")
+print("=" * 70)
+
+print(f"Successful rasters: {len(successful)}")
+for r in successful:
+    print(f"  OK: {r}")
+
+print(f"\nFailed rasters: {len(failed)}")
+for r, msg in failed:
+    print(f"  FAILED: {r}")
+    print(f"    {msg}")
+
+print(f"\nOutputs saved in:")
+print(out_gdb)
